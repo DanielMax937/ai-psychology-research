@@ -1,0 +1,22 @@
+https://arxiv.org/pdf/2206.14576
+  out=03_using_cognitive_psychology_to_understand_gpt3_binz_schulz_2023_arxiv.pdf
+https://www.mircomusolesi.org/papers/rsos24_irrationalityllms.pdf
+  out=06_irrationality_cognitive_biases_macmillan_scott_musolesi_2024.pdf
+https://arxiv.org/pdf/2302.02083
+  out=07_theory_of_mind_tasks_kosinski_2024_arxiv.pdf
+https://arxiv.org/pdf/2302.08399
+  out=08_tom_trivial_alterations_ullman_2023.pdf
+https://journals.sagepub.com/doi/pdf/10.1177/17456916231214460
+  out=09_ai_psychometrics_pellert_et_al_2024.pdf
+https://arxiv.org/pdf/2405.06058
+  out=10_social_desirability_bias_salecha_et_al_2024_arxiv.pdf
+https://www.cambridge.org/core/services/aop-cambridge-core/content/view/035D7C8A55B237942FB6DBAD7CAA4E49/S1047198723000025a.pdf/out-of-one-many-using-language-models-to-simulate-human-samples.pdf
+  out=11_out_of_one_many_argyle_et_al_2023.pdf
+https://journals.sagepub.com/doi/pdf/10.1177/25152459251410153
+  out=12_llms_as_psychological_simulators_lin_2026.pdf
+https://dspace.mit.edu/bitstream/handle/1721.1/152316/NMI_AI_beholder_Final-Unformatted%5B85%5D.pdf
+  out=13_priming_beliefs_about_ai_pataranutaporn_et_al_2023_mit_manuscript.pdf
+https://arxiv.org/pdf/2310.13548
+  out=14_sycophancy_in_language_models_sharma_et_al_2023.pdf
+https://www.nature.com/articles/s44159-023-00241-5.pdf
+  out=15_using_llms_in_psychology_demszky_et_al_2023.pdf
