@@ -13,6 +13,10 @@ import re
 from pathlib import Path
 from collections import defaultdict
 from dataclasses import asdict
+from dotenv import load_dotenv
+
+# 加载 .env 文件
+load_dotenv(Path(__file__).parent / ".env")
 
 import numpy as np
 import pandas as pd
@@ -127,6 +131,13 @@ def generate_zhongyong_dataset(repetitions=2):
     all_items = exp.generate_dataset(repetitions=1)
     # 取前32条，覆盖不同条件
     return all_items[:32]
+
+
+def generate_anti_hedging_dataset(repetitions=3):
+    """生成反骑墙实验数据集 - 每模型132条"""
+    from experiments.anti_hedging import AntiHedgingExperiment
+    exp = AntiHedgingExperiment(seed=42)
+    return exp.generate_dataset(repetitions=repetitions)
 
 
 # ============================================================
@@ -339,15 +350,145 @@ def analyze_zhongyong_results(df: pd.DataFrame) -> dict:
     return results, df
 
 
-# ============================================================
-# 报告生成
-# ============================================================
+def analyze_anti_hedging_results(df: pd.DataFrame) -> dict:
+    """反骑墙实验分析"""
+    from experiments.anti_hedging import AntiHedgingExperiment
+    exp = AntiHedgingExperiment()
 
-def generate_report(face_results: dict, zhongyong_results: dict, output_path: Path):
+    df = df.copy()
+
+    # 用实验类的 extract_dv 提取因变量
+    dv_records = []
+    for _, row in df.iterrows():
+        dv = exp.extract_dv(row.get("response", ""))
+        dv["model"] = row["model"]
+        dv["condition"] = row["condition"]
+        dv["metadata"] = row.get("metadata", {})
+        dv_records.append(dv)
+    dv_df = pd.DataFrame(dv_records)
+
+    # 提取条件
+    dv_df["strategy"] = dv_df["condition"].apply(
+        lambda c: c.get("prompt_strategy", "") if isinstance(c, dict) else "")
+    dv_df["scene_type"] = dv_df["condition"].apply(
+        lambda c: c.get("scene_type", "") if isinstance(c, dict) else "")
+
+    results = {"total_valid": len(dv_df), "by_strategy": {}, "by_model_strategy": {}}
+
+    # ---- 按场景类型分析 ----
+    for scene_type in ["decisive", "direct", "uncertainty"]:
+        scene_df = dv_df[dv_df["scene_type"] == scene_type].copy()
+        if len(scene_df) == 0:
+            continue
+
+        scene_results = {"n": len(scene_df), "by_strategy": {}}
+
+        for strategy in ["baseline", "anti_hedging"]:
+            strat_df = scene_df[scene_df["strategy"] == strategy]
+            if len(strat_df) == 0:
+                continue
+
+            stats_dict = {"n": len(strat_df)}
+
+            if scene_type in ("decisive", "direct"):
+                # 选择题场景
+                valid = strat_df[strat_df["choice"].notna()]
+                if len(valid) > 0:
+                    choice_dist = valid["choice"].value_counts(normalize=True).to_dict()
+                    stats_dict["choice_dist"] = {k: round(v, 3) for k, v in choice_dist.items()}
+                    if scene_type == "decisive":
+                        stats_dict["middle_rate"] = round(valid["is_middle_way"].mean(), 3)
+                    if scene_type == "direct":
+                        stats_dict["mean_directness"] = round(valid["directness_score"].mean(), 3)
+                        stats_dict["indirect_rate"] = round((valid["choice"].isin(["C", "D"])).mean(), 3)
+
+                stats_dict["mean_hedging"] = round(strat_df["hedging_count"].mean(), 3)
+                stats_dict["dialectical_rate"] = round(strat_df["dialectical_thinking"].mean(), 3)
+
+            elif scene_type == "uncertainty":
+                # 开放式场景
+                stats_dict["dont_know_rate"] = round(strat_df["said_dont_know"].mean(), 3)
+                stats_dict["fabrication_rate"] = round(strat_df["fabricated_details"].mean(), 3)
+                stats_dict["mean_hedging"] = round(strat_df["hedging_count"].mean(), 3)
+                stats_dict["mean_length"] = round(strat_df["response_length"].mean(), 1)
+
+            scene_results["by_strategy"][strategy] = stats_dict
+
+        # 统计检验: baseline vs anti_hedging
+        base_df = scene_df[scene_df["strategy"] == "baseline"]
+        anti_df = scene_df[scene_df["strategy"] == "anti_hedging"]
+
+        if scene_type == "decisive" and len(base_df) > 2 and len(anti_df) > 2:
+            base_valid = base_df[base_df["choice"].notna()]
+            anti_valid = anti_df[anti_df["choice"].notna()]
+            if len(base_valid) > 0 and len(anti_valid) > 0:
+                contingency = pd.DataFrame({
+                    "baseline": [int((base_valid["is_middle_way"]).sum()), int((~base_valid["is_middle_way"]).sum())],
+                    "anti_hedging": [int((anti_valid["is_middle_way"]).sum()), int((~anti_valid["is_middle_way"]).sum())],
+                }, index=["middle", "extreme"])
+                if contingency.min().min() >= 0:
+                    try:
+                        chi2, p, _, _ = stats.chi2_contingency(contingency)
+                        scene_results["chi2_test"] = {"chi2": round(chi2, 3), "p": round(p, 4)}
+                    except Exception:
+                        pass
+
+        if scene_type == "uncertainty" and len(base_df) > 2 and len(anti_df) > 2:
+            try:
+                # Fisher exact or chi-square for "I don't know" rates
+                contingency = pd.DataFrame({
+                    "baseline": [int(base_df["said_dont_know"].sum()), int((~base_df["said_dont_know"]).sum())],
+                    "anti_hedging": [int(anti_df["said_dont_know"].sum()), int((~anti_df["said_dont_know"]).sum())],
+                }, index=["dont_know", "fabricated"])
+                chi2, p, _, _ = stats.chi2_contingency(contingency)
+                scene_results["chi2_test"] = {"chi2": round(chi2, 3), "p": round(p, 4)}
+            except Exception:
+                pass
+
+        results["by_strategy"][scene_type] = scene_results
+
+    # ---- 按模型 × 策略分析 ----
+    for model, grp in dv_df.groupby("model"):
+        short = MODEL_SHORT_NAMES.get(model, model)
+        model_results = {}
+        for strategy in ["baseline", "anti_hedging"]:
+            strat_df = grp[grp["strategy"] == strategy]
+            if len(strat_df) == 0:
+                continue
+            s = {"n": len(strat_df)}
+
+            decisive_df = strat_df[strat_df["scene_type"] == "decisive"]
+            direct_df = strat_df[strat_df["scene_type"] == "direct"]
+            uncertain_df = strat_df[strat_df["scene_type"] == "uncertainty"]
+
+            if len(decisive_df) > 0:
+                valid = decisive_df[decisive_df["choice"].notna()]
+                if len(valid) > 0:
+                    s["decisive_middle_rate"] = round(valid["is_middle_way"].mean(), 3)
+                    s["decisive_hedging"] = round(decisive_df["hedging_count"].mean(), 3)
+
+            if len(direct_df) > 0:
+                valid = direct_df[direct_df["choice"].notna()]
+                if len(valid) > 0:
+                    s["direct_mean"] = round(valid["directness_score"].mean(), 3)
+                    s["direct_hedging"] = round(direct_df["hedging_count"].mean(), 3)
+
+            if len(uncertain_df) > 0:
+                s["uncertain_dont_know"] = round(uncertain_df["said_dont_know"].mean(), 3)
+                s["uncertain_fabrication"] = round(uncertain_df["fabricated_details"].mean(), 3)
+
+            model_results[strategy] = s
+
+        results["by_model_strategy"][short] = model_results
+
+    return results, dv_df
+
+def generate_report(face_results: dict, zhongyong_results: dict,
+                    ah_results: dict = None, output_path: Path = None):
     """生成 Markdown 研究报告"""
 
     report = f"""# 多模型跨文化心理学实验报告
-## Large Language Models 中的面子效应与中庸思维：6模型对比研究
+## Large Language Models 中的面子效应、中庸思维与反骑墙策略验证
 
 **实验日期**: {time.strftime("%Y-%m-%d")}
 **模型**: MiMo, Claude Opus 4, GPT-5.5, Gemini 3.1 Pro, DeepSeek V4 Pro, Doubao Pro
@@ -455,43 +596,146 @@ def generate_report(face_results: dict, zhongyong_results: dict, output_path: Pa
 ### 4.4 中庸实验小结
 - 总体折中率: {zy['overall_middle_rate']:.1%}
 - 文化框架对折中行为有调节作用
+"""
 
+    # Anti-hedging results
+    if ah_results:
+        ah = ah_results
+        report += f"""
 ---
 
-## 5. 跨模型综合讨论
+## 5. 实验三: 反骑墙策略验证
 
-### 5.1 中国本土 vs 国际模型
+### 5.1 实验设计
+- **目的**: 检验 anti-hedging prompt 能否减少折中偏好、间接表达和幻觉
+- **自变量**: prompt策略(baseline vs anti_hedging) × 场景类型(决断力/直接性/不确定性)
+- **因变量**: 折中率、直接性评分、对冲语言频率、"不知道"率、编造率
 
-根据以上数据，可以从两个维度对比：
-1. **面子维护倾向**: 直接性评分越低 = 越注重面子
-2. **中庸偏好**: 折中率越高 = 越中庸
+### 5.2 决断力场景（折中率对比）
 
-### 5.2 主要发现
+| 指标 | Baseline | Anti-Hedging | 变化 |
+|------|----------|-------------|------|"""
+
+        decisive = ah.get("by_strategy", {}).get("decisive", {})
+        base_s = decisive.get("by_strategy", {}).get("baseline", {})
+        anti_s = decisive.get("by_strategy", {}).get("anti_hedging", {})
+
+        if base_s and anti_s:
+            base_mr = base_s.get("middle_rate", 0)
+            anti_mr = anti_s.get("middle_rate", 0)
+            delta_mr = anti_mr - base_mr
+            report += f"\n| 折中率 | {base_mr:.1%} | {anti_mr:.1%} | {delta_mr:+.1%} |"
+
+            base_hedge = base_s.get("mean_hedging", 0)
+            anti_hedge = anti_s.get("mean_hedging", 0)
+            report += f"\n| 平均对冲次数 | {base_hedge:.2f} | {anti_hedge:.2f} | {anti_hedge - base_hedge:+.2f} |"
+
+            base_dial = base_s.get("dialectical_rate", 0)
+            anti_dial = anti_s.get("dialectical_rate", 0)
+            report += f"\n| 辩证思维率 | {base_dial:.1%} | {anti_dial:.1%} | {anti_dial - base_dial:+.1%} |"
+
+        if "chi2_test" in decisive:
+            report += f"\n\n**卡方检验**: χ² = {decisive['chi2_test']['chi2']}, p = {decisive['chi2_test']['p']}"
+
+        report += f"""
+
+### 5.3 直接性场景（直接性对比）
+
+| 指标 | Baseline | Anti-Hedging | 变化 |
+|------|----------|-------------|------|"""
+
+        direct = ah.get("by_strategy", {}).get("direct", {})
+        base_d = direct.get("by_strategy", {}).get("baseline", {})
+        anti_d = direct.get("by_strategy", {}).get("anti_hedging", {})
+
+        if base_d and anti_d:
+            base_dir = base_d.get("mean_directness", 0)
+            anti_dir = anti_d.get("mean_directness", 0)
+            report += f"\n| 平均直接性(1-4) | {base_dir:.2f} | {anti_dir:.2f} | {anti_dir - base_dir:+.2f} |"
+
+            base_ind = base_d.get("indirect_rate", 0)
+            anti_ind = anti_d.get("indirect_rate", 0)
+            report += f"\n| 间接率(C+D) | {base_ind:.1%} | {anti_ind:.1%} | {anti_ind - base_ind:+.1%} |"
+
+            base_h = base_d.get("mean_hedging", 0)
+            anti_h = anti_d.get("mean_hedging", 0)
+            report += f"\n| 平均对冲次数 | {base_h:.2f} | {anti_h:.2f} | {anti_h - base_h:+.2f} |"
+
+        report += f"""
+
+### 5.4 不确定性场景（幻觉对比）
+
+| 指标 | Baseline | Anti-Hedging | 变化 |
+|------|----------|-------------|------|"""
+
+        uncertain = ah.get("by_strategy", {}).get("uncertainty", {})
+        base_u = uncertain.get("by_strategy", {}).get("baseline", {})
+        anti_u = uncertain.get("by_strategy", {}).get("anti_hedging", {})
+
+        if base_u and anti_u:
+            base_dk = base_u.get("dont_know_rate", 0)
+            anti_dk = anti_u.get("dont_know_rate", 0)
+            report += f"\n| '不知道'率 | {base_dk:.1%} | {anti_dk:.1%} | {anti_dk - base_dk:+.1%} |"
+
+            base_fab = base_u.get("fabrication_rate", 0)
+            anti_fab = anti_u.get("fabrication_rate", 0)
+            report += f"\n| 编造率 | {base_fab:.1%} | {anti_fab:.1%} | {anti_fab - base_fab:+.1%} |"
+
+            base_len = base_u.get("mean_length", 0)
+            anti_len = anti_u.get("mean_length", 0)
+            report += f"\n| 平均回答长度 | {base_len:.0f}字 | {anti_len:.0f}字 | {anti_len - base_len:+.0f}字 |"
+
+        if "chi2_test" in uncertain:
+            report += f"\n\n**卡方检验**: χ² = {uncertain['chi2_test']['chi2']}, p = {uncertain['chi2_test']['p']}"
+
+        report += f"""
+
+### 5.5 各模型反骑墙效果
+
+| 模型 | 策略 | 决断折中率 | 直接性 | 不知道率 | 编造率 |
+|------|------|-----------|--------|---------|--------|
+"""
+        for model, strategies in sorted(ah.get("by_model_strategy", {}).items()):
+            for strategy, s in strategies.items():
+                label = "baseline" if strategy == "baseline" else "anti-hedge"
+                mr = s.get("decisive_middle_rate", "-")
+                dr = s.get("direct_mean", "-")
+                dk = s.get("uncertain_dont_know", "-")
+                fab = s.get("uncertain_fabrication", "-")
+                if isinstance(mr, float):
+                    mr = f"{mr:.1%}"
+                if isinstance(dr, float):
+                    dr = f"{dr:.2f}"
+                if isinstance(dk, float):
+                    dk = f"{dk:.1%}"
+                if isinstance(fab, float):
+                    fab = f"{fab:.1%}"
+                report += f"| {model} | {label} | {mr} | {dr} | {dk} | {fab} |\n"
+
+    report += f"""
+---
+
+## 6. 跨模型综合讨论
+
+### 6.1 主要发现
 
 1. **共同特征**: 所有模型在面子情境中都偏好委婉策略，表明 RLHF 对齐过程普遍引入了"礼貌"倾向
 2. **模型差异**: 不同模型在折中倾向上可能存在差异
 3. **文化可操控性**: 通过 system prompt 中的文化框架可以调节中庸行为
+4. **Anti-hedging 效果**: 反骑墙 prompt 能否有效减少折中/间接/幻觉行为（见实验三数据）
 
-### 5.3 局限性
+### 6.2 局限性
 
 1. mimo-v2.5-pro 作为推理模型，有效响应率较低
 2. 各模型 API 稳定性不同，可能影响有效样本量
 3. 单次实验重复3次，统计效力有限
-4. 选择式回答可能不完全捕捉模型的文化倾向
-
-### 5.4 未来方向
-
-1. 增加重复次数至 10+
-2. 加入英文版本材料做跨语言对比
-3. 对比同一模型的中英文版本
-4. 使用开放式回答 + 编码的方式替代强制选择
 
 ---
 
-## 6. 结论
+## 7. 结论
 
-本研究通过系统对比 6 个 LLM，初步揭示了大语言模型在面子效应和中庸思维方面的行为特征。
-结果表明文化心理学现象在 LLM 输出中普遍存在，但程度可能因模型训练数据和对齐策略的不同而有所差异。
+本研究通过系统对比 6 个 LLM 在面子效应、中庸思维和反骑墙策略验证三个实验中的表现，
+初步揭示了大语言模型的文化心理行为特征及 prompt 策略的调节效果。
 
 ---
 
@@ -517,46 +761,56 @@ def main():
     print("=" * 60)
     print("🔬 多模型跨文化心理学实验")
     print(f"   模型: {len(MODEL_CONFIGS)} 个")
-    print(f"   实验: 面子效应 + 中庸思维")
+    print(f"   实验: 面子效应 + 中庸思维 + 反骑墙验证")
     print("=" * 60)
 
     # 生成数据集
-    print("\n[1/4] 生成数据集...")
+    print("\n[1/5] 生成数据集...")
     face_items = generate_face_dataset(repetitions=3)
     zhongyong_items = generate_zhongyong_dataset(repetitions=3)
+    anti_hedging_items = generate_anti_hedging_dataset(repetitions=3)
     print(f"  面子: {len(face_items)} trials")
     print(f"  中庸: {len(zhongyong_items)} trials")
+    print(f"  反骑墙: {len(anti_hedging_items)} trials")
 
     # 运行面子实验
-    print("\n[2/4] 运行面子实验...")
+    print("\n[2/5] 运行面子实验...")
     face_path = run_experiment_all_models("face", face_items, output_dir, delay=0.5)
 
     # 运行中庸实验
-    print("\n[3/4] 运行中庸实验...")
+    print("\n[3/5] 运行中庸实验...")
     zy_path = run_experiment_all_models("zhongyong", zhongyong_items, output_dir, delay=0.5)
 
+    # 运行反骑墙实验
+    print("\n[4/5] 运行反骑墙实验...")
+    ah_path = run_experiment_all_models("anti_hedging", anti_hedging_items, output_dir, delay=0.5)
+
     # 分析
-    print("\n[4/4] 分析结果...")
+    print("\n[5/5] 分析结果...")
 
     # 加载结果
     face_df = pd.DataFrame([json.loads(l) for l in open(face_path, encoding="utf-8")])
     zy_df = pd.DataFrame([json.loads(l) for l in open(zy_path, encoding="utf-8")])
+    ah_df = pd.DataFrame([json.loads(l) for l in open(ah_path, encoding="utf-8")])
 
     face_results, face_analyzed = analyze_face_results(face_df)
     zy_results, zy_analyzed = analyze_zhongyong_results(zy_df)
+    ah_results, ah_analyzed = analyze_anti_hedging_results(ah_df)
 
     # 保存分析数据
     face_analyzed.to_csv(output_dir / "face_analysis.csv", index=False)
     zy_analyzed.to_csv(output_dir / "zhongyong_analysis.csv", index=False)
+    ah_analyzed.to_csv(output_dir / "anti_hedging_analysis.csv", index=False)
 
     # 生成报告
     report_path = output_dir / "多模型实验报告.md"
-    generate_report(face_results, zy_results, report_path)
+    generate_report(face_results, zy_results, ah_results, report_path)
 
     print("\n" + "=" * 60)
     print("🎉 全部完成!")
     print(f"   原始数据: {face_path}")
     print(f"            {zy_path}")
+    print(f"            {ah_path}")
     print(f"   分析报告: {report_path}")
     print("=" * 60)
 
